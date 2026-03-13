@@ -59,8 +59,12 @@ To produce a valid ticket in *kirbi* format:
                 kvno   None
                 cipher [2] : fYH8MIH5oIH2MIHzMIHwoCswKaADAgESoSIEIBensJXo6NKdyVioxhu4Wz/+IoSeJ2TMdyaiVg/fmP4XoRMbEUFUVEFDS1JBTkdFLkxPQ0FMohowGKADAgEBoREwDxsNU0EtTU9OSVRPUklOR6MHAwUAQOEAAKQRGA8yMDI2MDMxMzEyMzExOVqlERgPMjAyNjAzMTMxMjMxMTlaphEYDzIwMjYwMzEzMTIzMTE5WqcRGA8yMDI2MDMxMzEyMzExOVqoExsRQVRUQUNLUkFOR0UuTE9DQUypJjAkoAMCAQKhHTAbGwZrcmJ0Z3QbEUFUVEFDS1JBTkdFLkxPQ0FM
 **************************************************
-Saving KRB-CRED in c:\work\tmp\example.kirbi
+Saving KRB-CRED in example.kirbi
 ```
+
+🔵 **Microsoft-Windows-Security-Kerberos** ETW provider exposed the event ID **202** that will monitor attempts to export sessions keys with not enough privileges.🔵
+
+![img.png](.img%2Fimg.png)
 
 ## kerasktgt Kerberos Ask Ticket Granting Ticket
 
