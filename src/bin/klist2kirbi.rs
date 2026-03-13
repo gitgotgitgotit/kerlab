@@ -26,11 +26,11 @@ fn main() {
         .arg(Arg::with_name("klist")
             .long("klist")
             .takes_value(true)
-            .help("Path to the klist output"))
+            .help("Path to file that contain the klist output"))
         .arg(Arg::with_name("outfile")
             .long("outfile")
             .takes_value(true)
-            .help("Output file path"))
+            .help("Output kirbi file path"))
         .get_matches();
 
     let contents = fs::read_to_string(
@@ -64,7 +64,7 @@ fn main() {
         client_name = Some(caps["clientname"].to_string());
     };
 
-    let reg_session_key = Regex::new(r"Session Key\s+: KeyType 0x(?<keytype>\d{2}) - (?<keytypename>[a-zA-Z0-9\-]+)\r?\n\s+: KeyLength (?<keylength>\d\d) - (?<sessionkey>[^\n]+)\n").unwrap();
+    let reg_session_key = Regex::new(r"Session Key\s+: KeyType 0x(?<keytype>\d{2}) - (?<keytypename>[a-zA-Z0-9\-]+)\r?\n\s+: KeyLength (?<keylength>\d\d) - (?<sessionkey>[^\r\n]+)\r?\n").unwrap();
 
     if let Some(caps) = reg_session_key.captures(&contents) {
         session_key = Some(hex::decode(caps["sessionkey"].replace(" ", "")).unwrap());

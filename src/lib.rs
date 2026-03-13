@@ -1,4 +1,3 @@
-#![feature(adt_const_params)]
 
 extern crate yasna;
 extern crate indexmap;
